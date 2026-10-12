@@ -99,14 +99,26 @@ fi
 
 # Ports : Caloo écoute sur des ports discrets ; les ports 53 et 80 du tunnel y sont redirigés.
 # Ainsi aucun conflit avec un nginx, Apache, Docker ou DNS déjà présent sur le VPS.
+redirect_ok() {
+  local r=(PREROUTING -i caloo-test -p udp --dport 53 -j REDIRECT --to-ports 10053)
+  iptables -t nat -A "${r[@]}" 2>/dev/null || return 1
+  iptables -t nat -D "${r[@]}" 2>/dev/null
+  return 0
+}
 sed -i '/# caloo-redirect$/d' "$WG_CONF"
-if iptables -t nat -S >/dev/null 2>&1; then
+if redirect_ok; then
   MODE=redirect
   DNS_PORT=10053
   HTTP_PORT=10080
-  rule() { echo "iptables -t nat -$1 PREROUTING -i %i -d $WG_IP -p $2 --dport $3 -j REDIRECT --to-ports $4"; }
-  up="$(rule A udp 53 $DNS_PORT); $(rule A tcp 53 $DNS_PORT); $(rule A tcp 80 $HTTP_PORT)"
-  down="$(rule D udp 53 $DNS_PORT); $(rule D tcp 53 $DNS_PORT); $(rule D tcp 80 $HTTP_PORT)"
+  # Règles tolérantes : « ajoute si absente » / « retire si présente », pour que WireGuard
+  # ne puisse jamais échouer à cause d'elles au démarrage ou à l'arrêt.
+  r() { echo "PREROUTING -i %i -d $WG_IP -p $1 --dport $2 -j REDIRECT --to-ports $3"; }
+  up="" down=""
+  for spec in "udp 53 $DNS_PORT" "tcp 53 $DNS_PORT" "tcp 80 $HTTP_PORT"; do
+    rule="$(r $spec)"
+    up+="iptables -t nat -C $rule 2>/dev/null || iptables -t nat -A $rule; "
+    down+="iptables -t nat -D $rule 2>/dev/null || true; "
+  done
   sed -i "/^PrivateKey/a PostUp = $up # caloo-redirect" "$WG_CONF"
   sed -i "/^PrivateKey/a PreDown = $down # caloo-redirect" "$WG_CONF"
   echo "Redirection 53→$DNS_PORT et 80→$HTTP_PORT dans le tunnel."
@@ -142,7 +154,15 @@ if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
 fi
 
 systemctl enable -q "wg-quick@$WG_IF"
-systemctl restart "wg-quick@$WG_IF" || die "WireGuard n'a pas démarré : journalctl -u wg-quick@$WG_IF -n 30"
+# Redémarrage propre : on retire l'interface même si l'arrêt précédent a échoué.
+systemctl stop "wg-quick@$WG_IF" 2>/dev/null || true
+ip link del "$WG_IF" 2>/dev/null || true
+if ! systemctl start "wg-quick@$WG_IF"; then
+  echo "----- erreur de WireGuard -----"
+  wg-quick up "$WG_IF" 2>&1 | tail -20 || true
+  wg-quick down "$WG_IF" &>/dev/null || true
+  die "WireGuard n'a pas démarré. Envoie les lignes ci-dessus pour diagnostic."
+fi
 
 # ---------------------------------------------------------------- serveur Caloo
 systemctl stop caloo 2>/dev/null || true
@@ -256,9 +276,9 @@ for _ in $(seq 1 20); do
 done
 if [[ $ok != yes ]]; then
   echo
-  systemctl status caloo --no-pager -n 0 || true
+  timeout 5 systemctl status caloo --no-pager -n 0 || true
   echo "----- derniers messages de Caloo -----"
-  journalctl -u caloo -n 30 --no-pager -o cat 2>/dev/null || true
+  timeout 5 journalctl -u caloo -n 30 --no-pager -o cat 2>/dev/null || true
   die "Caloo n'a pas démarré. Envoie les lignes ci-dessus pour diagnostic."
 fi
 echo "Caloo répond sur http://$WG_IP:$API_PORT"
