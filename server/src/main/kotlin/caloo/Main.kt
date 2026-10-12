@@ -17,10 +17,6 @@ fun main(args: Array<String>) {
     val dns = open("le DNS", cfg.dnsBind, cfg.dnsPort) { DnsServer(cfg, store, log) }.also { it.start() }
     val web = open("le serveur web", cfg.httpBind, cfg.httpPort) { WebServer(cfg, store) }.also { it.start() }
     val api = open("l'API", cfg.apiBind, cfg.apiPort) { ApiServer(cfg, store, log) }.also { it.start() }
-    val bridge = if (cfg.bridgePort > 0) {
-        open("le pont TCP", cfg.bridgeBind, cfg.bridgePort) { TcpBridge(cfg.bridgeBind, cfg.bridgePort, cfg.bridgeTarget) }
-            .also { it.start(); println("Pont TCP ${cfg.bridgeBind}:${cfg.bridgePort} -> WireGuard ${cfg.bridgeTarget}") }
-    } else null
 
     // Les modifications faites à la main sur le serveur sont prises en compte toutes seules.
     Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay(
@@ -32,7 +28,6 @@ fun main(args: Array<String>) {
             "web ${cfg.httpBind}:${cfg.httpPort} - API ${cfg.apiBind}:${cfg.apiPort}",
     )
     Runtime.getRuntime().addShutdownHook(Thread {
-        bridge?.stop()
         api.stop()
         web.stop()
         dns.stop()

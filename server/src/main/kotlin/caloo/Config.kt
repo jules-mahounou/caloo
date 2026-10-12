@@ -17,10 +17,6 @@ data class Config(
     val extensionsDir: File,
     val token: String,
     val maxSiteMb: Int,
-    /** Pont TCP pour WireGuard (0 = désactivé). Réglé par install.sh via l'environnement. */
-    val bridgeBind: String,
-    val bridgePort: Int,
-    val bridgeTarget: String,
 ) {
     companion object {
         fun load(file: File): Config {
@@ -40,9 +36,6 @@ data class Config(
                 extensionsDir = File(j.optString("extensionsDir", "/var/lib/caloo/extensions")),
                 token = token,
                 maxSiteMb = j.optInt("maxSiteMb", 100),
-                bridgeBind = System.getenv("CALOO_BRIDGE_BIND") ?: j.optString("bridgeBind", "0.0.0.0"),
-                bridgePort = System.getenv("CALOO_BRIDGE_PORT")?.toIntOrNull() ?: j.optInt("bridgePort", 0),
-                bridgeTarget = System.getenv("CALOO_BRIDGE_TARGET") ?: j.optString("bridgeTarget", "127.0.0.1:51820"),
             )
         }
     }
