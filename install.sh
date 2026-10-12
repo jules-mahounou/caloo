@@ -8,6 +8,7 @@
 #   CALOO_WG_PORT=51820         port UDP WireGuard
 #   CALOO_WG_IF=wg0             nom de l'interface WireGuard
 #   CALOO_WG_NET=10.8.0         réseau privé (/24)
+#   CALOO_TCP_PORT=8443         pont TCP pour WireGuard si l'hébergeur bloque l'UDP (0 = désactiver)
 #   CALOO_BUILD=1               compiler le serveur sur place au lieu de télécharger la version de GitHub
 set -euo pipefail
 
@@ -32,6 +33,8 @@ WG_IF="${CALOO_WG_IF:-${WG_IF:-wg0}}"
 WG_NET="${CALOO_WG_NET:-${WG_NET:-10.8.0}}"
 WG_PORT="${CALOO_WG_PORT:-${WG_PORT:-51820}}"
 ENDPOINT="${CALOO_ENDPOINT:-${ENDPOINT:-}}"
+TCP_PORT="${CALOO_TCP_PORT:-${TCP_PORT:-}}"
+[[ $TCP_PORT == 0 || $TCP_PORT == off ]] && TCP_PORT=""
 WG_CONF=/etc/wireguard/$WG_IF.conf
 WG_IP=$WG_NET.1
 IN_CONTAINER=no
@@ -149,25 +152,31 @@ if [[ -z $ENDPOINT ]]; then
   [[ -n $ENDPOINT ]] || die "adresse publique introuvable : relance avec CALOO_ENDPOINT=ip.du.vps sudo ./install.sh"
 fi
 
+# Avec le pont TCP, WireGuard du téléphone parle à l'app Caloo (127.0.0.1:51820), qui relaie en TCP.
+if [[ -n $TCP_PORT ]]; then PEER_ENDPOINT="127.0.0.1:51820"; else PEER_ENDPOINT="$ENDPOINT:$WG_PORT"; fi
+
 cat > "$ENV_FILE" <<EOF
 WG_IF=$WG_IF
 WG_NET=$WG_NET
 WG_PORT=$WG_PORT
 ENDPOINT=$ENDPOINT
+TCP_PORT=$TCP_PORT
+PEER_ENDPOINT=$PEER_ENDPOINT
 EOF
 
 # Les appareils existants suivent l'adresse et le port du serveur (à rescanner s'ils changent).
 CHANGED_PEERS=""
 for f in "$CONF_DIR"/peers/*.conf; do
   [[ -f $f ]] || continue
-  if ! grep -q "^Endpoint = $ENDPOINT:$WG_PORT\$" "$f"; then
-    sed -i -E "s/^Endpoint *=.*/Endpoint = $ENDPOINT:$WG_PORT/" "$f"
+  if ! grep -q "^Endpoint = $PEER_ENDPOINT\$" "$f"; then
+    sed -i -E "s/^Endpoint *=.*/Endpoint = $PEER_ENDPOINT/" "$f"
     CHANGED_PEERS+=" $(basename "$f" .conf)"
   fi
 done
 
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow "$WG_PORT/udp" >/dev/null
+  [[ -z $TCP_PORT ]] || ufw allow "$TCP_PORT/tcp" >/dev/null
   ufw allow in on "$WG_IF" >/dev/null
   ufw route allow in on "$WG_IF" out on "$WG_IF" >/dev/null
   echo "Pare-feu ufw ouvert pour WireGuard."
@@ -242,7 +251,7 @@ chmod 640 "$CONF_DIR/config.json"
 
 # Vérifie que les ports de Caloo sont libres, et dit qui les occupe sinon.
 busy=""
-for p in "udp $DNS_PORT" "tcp $DNS_PORT" "tcp $HTTP_PORT" "tcp $API_PORT"; do
+for p in "udp $DNS_PORT" "tcp $DNS_PORT" "tcp $HTTP_PORT" "tcp $API_PORT" ${TCP_PORT:+"tcp $TCP_PORT"}; do
   set -- $p
   line="$(ss -Hln${1:0:1}p "sport = :$2" 2>/dev/null | grep -E "(\*|0\.0\.0\.0|\[::\]|$WG_IP):$2 " || true)"
   [[ -n $line ]] && busy+="  port $2/$1 : $(grep -oE 'users:\(\("[^"]+"' <<<"$line" | head -1 | cut -d'"' -f2)"$'\n'
@@ -264,6 +273,11 @@ PrivateTmp=true
 ReadWritePaths=$DATA_DIR"
 fi
 
+BRIDGE_ENV=""
+if [[ -n $TCP_PORT ]]; then
+  BRIDGE_ENV="Environment=CALOO_BRIDGE_PORT=$TCP_PORT CALOO_BRIDGE_BIND=0.0.0.0 CALOO_BRIDGE_TARGET=127.0.0.1:$WG_PORT"
+fi
+
 cat > /etc/systemd/system/caloo.service <<EOF
 [Unit]
 Description=Caloo (DNS + sites perso)
@@ -277,6 +291,7 @@ Environment="JAVA_OPTS=-Xmx128m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xss512
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
+$BRIDGE_ENV
 $CAPS
 $HARDENING
 
@@ -341,6 +356,14 @@ cat <<EOF
   3. Installe l'app Caloo (APK des « Releases » GitHub) et renseigne :
        Serveur : http://$WG_IP:$API_PORT
        Token   : $TOKEN
+EOF
+if [[ -n $TCP_PORT ]]; then
+  cat <<EOF
+       Pont TCP : $ENDPOINT:$TCP_PORT
+     (l'app Caloo doit tourner pour que le tunnel WireGuard fonctionne)
+EOF
+fi
+cat <<EOF
 
   Autres appareils : sudo caloo-peer add pc-portable   (puis list / show / remove)
   Mise à jour      : git pull && sudo ./install.sh
