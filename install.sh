@@ -5,7 +5,9 @@
 #
 # Variables optionnelles :
 #   CALOO_ENDPOINT=mon.vps.fr   adresse publique du VPS (détectée sinon)
-#   CALOO_WG_PORT=51820         port UDP WireGuard
+#   CALOO_WG_PORT=51820         port UDP d'ecoute de WireGuard
+#   CALOO_WG_WAN_PORT=53        port UDP public annonce aux appareils, redirige vers le precedent.
+#                               Utile quand l'operateur ne laisse sortir l'UDP que vers un port (53).
 #   CALOO_WG_IF=wg0             nom de l'interface WireGuard
 #   CALOO_WG_NET=10.8.0         réseau privé (/24)
 #   CALOO_BUILD=1               compiler le serveur sur place au lieu de télécharger la version de GitHub
@@ -31,8 +33,12 @@ command -v apt-get >/dev/null || die "ce script est prévu pour Ubuntu / Debian"
 WG_IF="${CALOO_WG_IF:-${WG_IF:-wg0}}"
 WG_NET="${CALOO_WG_NET:-${WG_NET:-10.8.0}}"
 WG_PORT="${CALOO_WG_PORT:-${WG_PORT:-51820}}"
+WG_WAN_PORT="${CALOO_WG_WAN_PORT:-${WG_WAN_PORT:-$WG_PORT}}"
 ENDPOINT="${CALOO_ENDPOINT:-${ENDPOINT:-}}"
 WG_CONF=/etc/wireguard/$WG_IF.conf
+# Interface par laquelle le VPS voit Internet : c'est la que se pose la redirection du port public.
+WAN_IF="$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+[[ -n $WAN_IF ]] || WAN_IF=eth0
 WG_IP=$WG_NET.1
 IN_CONTAINER=no
 systemd-detect-virt -c -q 2>/dev/null && IN_CONTAINER=yes
@@ -129,6 +135,14 @@ if redirect_ok; then
     up+="iptables -t nat -C $rule 2>/dev/null || iptables -t nat -A $rule; "
     down+="iptables -t nat -D $rule 2>/dev/null || true; "
   done
+  # Port public distinct : les appareils composent WG_WAN_PORT, qu'on renvoie vers le port d'ecoute.
+  # On ne peut pas simplement mettre ListenPort = 53 : systemd-resolved occupe deja 127.0.0.53:53.
+  if [[ $WG_WAN_PORT != "$WG_PORT" ]]; then
+    wan="PREROUTING -i $WAN_IF -p udp --dport $WG_WAN_PORT -j REDIRECT --to-ports $WG_PORT"
+    up+="iptables -t nat -C $wan 2>/dev/null || iptables -t nat -A $wan; "
+    down+="iptables -t nat -D $wan 2>/dev/null || true; "
+    echo "Port public UDP $WG_WAN_PORT → $WG_PORT sur $WAN_IF."
+  fi
   sed -i "/^PrivateKey/a PostUp = $up # caloo-redirect" "$WG_CONF"
   sed -i "/^PrivateKey/a PreDown = $down # caloo-redirect" "$WG_CONF"
   echo "Redirection 53→$DNS_PORT et 80→$HTTP_PORT dans le tunnel."
@@ -137,6 +151,7 @@ else
   DNS_PORT=53
   HTTP_PORT=80
   warn "iptables indisponible : Caloo écoutera directement sur les ports 53 et 80."
+  [[ $WG_WAN_PORT == "$WG_PORT" ]] || die "CALOO_WG_WAN_PORT exige iptables, indisponible ici."
 fi
 
 # Laisse tes appareils se parler entre eux à travers le tunnel (peut échouer en LXC, sans gravité).
@@ -153,6 +168,7 @@ cat > "$ENV_FILE" <<EOF
 WG_IF=$WG_IF
 WG_NET=$WG_NET
 WG_PORT=$WG_PORT
+WG_WAN_PORT=$WG_WAN_PORT
 ENDPOINT=$ENDPOINT
 EOF
 
@@ -160,14 +176,15 @@ EOF
 CHANGED_PEERS=""
 for f in "$CONF_DIR"/peers/*.conf; do
   [[ -f $f ]] || continue
-  if ! grep -q "^Endpoint = $ENDPOINT:$WG_PORT\$" "$f"; then
-    sed -i -E "s/^Endpoint *=.*/Endpoint = $ENDPOINT:$WG_PORT/" "$f"
+  if ! grep -q "^Endpoint = $ENDPOINT:$WG_WAN_PORT\$" "$f"; then
+    sed -i -E "s/^Endpoint *=.*/Endpoint = $ENDPOINT:$WG_WAN_PORT/" "$f"
     CHANGED_PEERS+=" $(basename "$f" .conf)"
   fi
 done
 
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow "$WG_PORT/udp" >/dev/null
+  [[ $WG_WAN_PORT == "$WG_PORT" ]] || ufw allow "$WG_WAN_PORT/udp" >/dev/null
   ufw allow in on "$WG_IF" >/dev/null
   ufw route allow in on "$WG_IF" out on "$WG_IF" >/dev/null
   echo "Pare-feu ufw ouvert pour WireGuard."

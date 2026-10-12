@@ -58,7 +58,7 @@ DNS = $WG_NET.1
 [Peer]
 PublicKey = $(cat /etc/wireguard/caloo-server.pub)
 PresharedKey = $psk
-Endpoint = $ENDPOINT:$WG_PORT
+Endpoint = $ENDPOINT:${WG_WAN_PORT:-$WG_PORT}
 AllowedIPs = $WG_NET.0/24
 PersistentKeepalive = 25
 EOF
