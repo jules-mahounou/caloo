@@ -4,9 +4,12 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -44,10 +47,6 @@ class MainActivity : Activity() {
             "dns" to "Demande à un autre serveur DNS.\nCible : 1.1.1.1, 8.8.8.8",
             "block" to "Bloque le domaine. Cible : vide.",
         )
-        private val NAVY = Color.parseColor("#10203A")
-        private val TEAL = Color.parseColor("#2BB3A3")
-        private val GREY = Color.parseColor("#6B7280")
-        private val RED = Color.parseColor("#D9534F")
     }
 
     private lateinit var prefs: SharedPreferences
@@ -56,6 +55,23 @@ class MainActivity : Activity() {
     private var actions = listOf("site", "proxy", "redirect", "ip", "dns", "block")
     private var pendingSite: String? = null
 
+    // Palette resolue au demarrage plutot que figee, pour suivre le mode sombre du systeme.
+    // NAVY designe la couleur du texte fort : sombre sur fond clair, clair sur fond sombre.
+    private var NAVY = 0; private var TEAL = 0; private var GREY = 0; private var RED = 0
+    private var BG = 0; private var SURFACE = 0; private var BORDER = 0
+
+    private fun applyPalette() {
+        val night = resources.configuration.uiMode and
+            Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
+        TEAL = Color.parseColor("#2BB3A3")
+        NAVY = Color.parseColor(if (night) "#E8EDF5" else "#10203A")
+        GREY = Color.parseColor(if (night) "#9AA4B2" else "#6B7280")
+        RED = Color.parseColor(if (night) "#FF7A7A" else "#D9534F")
+        BG = Color.parseColor(if (night) "#0D1726" else "#FFFFFF")
+        SURFACE = Color.parseColor(if (night) "#16233A" else "#F5F7FA")
+        BORDER = Color.parseColor(if (night) "#243249" else "#E3E8EF")
+    }
+
     private val api get() = Api(prefs.getString("url", DEFAULT_URL)!!, prefs.getString("token", "")!!)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -63,16 +79,25 @@ class MainActivity : Activity() {
         prefs = getSharedPreferences("caloo", MODE_PRIVATE)
         pendingSite = savedInstanceState?.getString("pendingSite")
 
-        val root = vertical().apply { setPadding(dp(16), dp(12), dp(16), dp(32)) }
-        status = text("", 14f).apply { setPadding(0, 0, 0, dp(8)) }
-        root.addView(status)
-        root.addView(row(button("Actualiser") { refresh() }, button("+ Ajouter") { edit(null) }))
+        applyPalette()
+        val root = vertical().apply { setPadding(dp(16), dp(16), dp(16), dp(32)) }
+        status = text("", 14f).apply { setLineSpacing(dp(3).toFloat(), 1f) }
+        root.addView(card(status))
+        root.addView(spacer(dp(16)))
+        root.addView(row(primary("Actualiser") { refresh() }, primary("+ Ajouter") { edit(null) }))
+        root.addView(spacer(dp(8)))
         root.addView(row(button("Journal DNS") { showLog() }, button("Réglages") { settings() }))
+        root.addView(spacer(dp(8)))
         root.addView(row(button("WireGuard") { openWireGuard() }, button("Point d'accès") { openHotspot() }))
-        root.addView(text("Extensions", 18f, bold = true).apply { setPadding(0, dp(20), 0, dp(6)) })
+        root.addView(sectionTitle("EXTENSIONS"))
         list = vertical()
         root.addView(list)
-        setContentView(ScrollView(this).apply { isFillViewport = true; fitsSystemWindows = true; addView(root) })
+        setContentView(ScrollView(this).apply {
+            isFillViewport = true
+            fitsSystemWindows = true
+            setBackgroundColor(BG)
+            addView(root)
+        })
 
         if (prefs.getString("token", "").isNullOrEmpty()) settings() else refresh()
     }
@@ -107,20 +132,25 @@ class MainActivity : Activity() {
 
     private fun render(exts: JSONArray) {
         list.removeAllViews()
-        if (exts.length() == 0) list.addView(text("Aucune extension. Appuie sur « + Ajouter ».", 14f).apply { setTextColor(GREY) })
+        if (exts.length() == 0) list.addView(
+            card(text("Aucune extension pour l'instant.\nAppuie sur « + Ajouter » pour en créer une.", 14f)
+                .apply { setTextColor(GREY); setLineSpacing(dp(3).toFloat(), 1f) }),
+        )
         for (i in 0 until exts.length()) {
             val e = exts.getJSONObject(i)
             val enabled = e.optBoolean("enabled", true)
             val domains = e.optJSONArray("domains")?.let { d -> List(d.length()) { d.getString(it) } } ?: emptyList()
             val target = e.optString("target")
             val card = vertical().apply {
-                setPadding(dp(14), dp(10), dp(14), dp(10))
+                setPadding(dp(16), dp(14), dp(16), dp(14))
                 background = GradientDrawable().apply {
-                    cornerRadius = dp(10).toFloat()
-                    setStroke(dp(1), if (enabled) TEAL else Color.LTGRAY)
+                    cornerRadius = dp(14).toFloat()
+                    setColor(SURFACE)
+                    setStroke(dp(1), if (enabled) TEAL else BORDER)
                 }
-                alpha = if (enabled) 1f else 0.55f
-                layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(8) }
+                alpha = if (enabled) 1f else 0.6f
+                layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(10) }
+                isClickable = true
                 setOnClickListener { edit(e) }
             }
             card.addView(text(e.getString("name") + if (enabled) "" else "  (désactivée)", 16f, bold = true).apply { setTextColor(NAVY) })
@@ -338,17 +368,76 @@ class MainActivity : Activity() {
         return EditText(this).apply {
             setText(value)
             setSingleLine(false)
-            parent.addView(this)
+            textSize = 15f
+            setTextColor(NAVY)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(10).toFloat()
+                setColor(SURFACE)
+                setStroke(dp(1), BORDER)
+            }
+            parent.addView(
+                this,
+                LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(6) },
+            )
         }
     }
 
-    private fun button(title: String, onClick: () -> Unit) = Button(this).apply {
-        text = title
-        isAllCaps = false
-        setOnClickListener { onClick() }
+    /** Bouton secondaire : surface discrete et contour leger. */
+    private fun button(title: String, onClick: () -> Unit) =
+        styledButton(title, SURFACE, NAVY, BORDER, onClick)
+
+    /** Bouton principal : aplat de la couleur d'accent. */
+    private fun primary(title: String, onClick: () -> Unit) =
+        styledButton(title, TEAL, Color.WHITE, TEAL, onClick)
+
+    private fun styledButton(title: String, fill: Int, ink: Int, stroke: Int, onClick: () -> Unit) =
+        Button(this).apply {
+            fun shape() = GradientDrawable().apply {
+                cornerRadius = dp(12).toFloat()
+                setColor(fill)
+                setStroke(dp(1), stroke)
+            }
+            text = title
+            isAllCaps = false
+            textSize = 15f
+            setTextColor(ink)
+            minHeight = dp(48)
+            setPadding(dp(10), dp(12), dp(10), dp(12))
+            // Retire l'ombre animee heritee du theme : l'ensemble reste plat et homogene.
+            stateListAnimator = null
+            val ripple = Color.argb(70, Color.red(ink), Color.green(ink), Color.blue(ink))
+            background = RippleDrawable(ColorStateList.valueOf(ripple), shape(), shape())
+            setOnClickListener { onClick() }
+        }
+
+    /** Encadre de contenu : surface douce, coins arrondis. */
+    private fun card(child: View) = vertical().apply {
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = GradientDrawable().apply {
+            cornerRadius = dp(14).toFloat()
+            setColor(SURFACE)
+            setStroke(dp(1), BORDER)
+        }
+        addView(child)
+    }
+
+    private fun spacer(h: Int) = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, h)
+    }
+
+    private fun sectionTitle(s: String) = text(s, 12f, bold = true).apply {
+        setTextColor(GREY)
+        letterSpacing = 0.12f
+        setPadding(dp(4), dp(24), 0, dp(10))
     }
 
     private fun row(vararg views: View) = LinearLayout(this).apply {
-        views.forEach { addView(it, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)) }
+        views.forEachIndexed { i, v ->
+            addView(
+                v,
+                LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { if (i > 0) leftMargin = dp(8) },
+            )
+        }
     }
 }

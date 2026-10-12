@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Variante sombre : seul le fond de fenêtre change ici, la palette du contenu
+     est résolue à l'exécution dans MainActivity.applyPalette(). -->
+<resources>
+    <style name="Caloo" parent="android:Theme.Material">
+        <item name="android:colorPrimary">@color/caloo_navy</item>
+        <item name="android:colorPrimaryDark">@color/caloo_navy</item>
+        <item name="android:colorAccent">@color/caloo_teal</item>
+        <item name="android:windowBackground">#0D1726</item>
+    </style>
+</resources>
