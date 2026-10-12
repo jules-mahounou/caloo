@@ -8,13 +8,16 @@
 #   CALOO_WG_PORT=51820         port UDP WireGuard
 #   CALOO_WG_IF=wg0             nom de l'interface WireGuard
 #   CALOO_WG_NET=10.8.0         réseau privé (/24)
+#   CALOO_BUILD=1               compiler le serveur sur place au lieu de télécharger la version de GitHub
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELEASE_URL="${CALOO_RELEASE_URL:-https://github.com/jules-mahounou/caloo/releases/download/caloo-latest/caloo-server.tar.gz}"
 CONF_DIR=/etc/caloo
 DATA_DIR=/var/lib/caloo
 APP_DIR=/opt/caloo
 ENV_FILE=$CONF_DIR/install.env
+API_PORT=8053
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[!] %s\033[0m\n' "$*"; }
@@ -30,6 +33,7 @@ WG_NET="${CALOO_WG_NET:-${WG_NET:-10.8.0}}"
 WG_PORT="${CALOO_WG_PORT:-${WG_PORT:-51820}}"
 ENDPOINT="${CALOO_ENDPOINT:-${ENDPOINT:-}}"
 WG_CONF=/etc/wireguard/$WG_IF.conf
+WG_IP=$WG_NET.1
 IN_CONTAINER=no
 systemd-detect-virt -c -q 2>/dev/null && IN_CONTAINER=yes
 
@@ -37,7 +41,7 @@ systemd-detect-virt -c -q 2>/dev/null && IN_CONTAINER=yes
 say "Installation des paquets"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq wireguard-tools qrencode openjdk-17-jdk-headless curl iproute2 ca-certificates >/dev/null
+apt-get install -y -qq wireguard-tools qrencode openjdk-17-jre-headless curl iproute2 iptables ca-certificates >/dev/null
 
 # ---------------------------------------------------------------- WireGuard
 say "WireGuard"
@@ -58,12 +62,18 @@ else
   [[ -c /dev/net/tun ]] || die "ton conteneur n'a pas accès à /dev/net/tun.
   Active l'option « TUN/TAP » dans le panneau de ton hébergeur VPS (ou demande-lui
   de charger le module wireguard), redémarre le VPS puis relance ce script."
+  had_go=no
+  dpkg -s golang-go &>/dev/null && had_go=yes
   apt-get install -y -qq golang-go git make >/dev/null
   tmp=$(mktemp -d)
   git clone -q --depth 1 --branch 0.0.20230223 https://git.zx2c4.com/wireguard-go "$tmp/wg"
   make -s -C "$tmp/wg"
   install -m 755 "$tmp/wg/wireguard-go" /usr/local/bin/wireguard-go
-  rm -rf "$tmp"
+  rm -rf "$tmp" /root/go /root/.cache/go-build
+  # Go ne servait qu'à compiler wireguard-go : on le retire s'il n'était pas là avant.
+  if [[ $had_go == no ]]; then
+    apt-get purge -y -qq $(dpkg-query -W -f='${Package}\n' 'golang-*' 2>/dev/null) >/dev/null || true
+  fi
   echo "wireguard-go installé."
 fi
 
@@ -76,7 +86,7 @@ if [[ ! -f $WG_CONF ]]; then
    cat > "$WG_CONF" <<EOF
 # caloo
 [Interface]
-Address = $WG_NET.1/24
+Address = $WG_IP/24
 ListenPort = $WG_PORT
 PrivateKey = $(cat /etc/wireguard/caloo-server.key)
 EOF
@@ -85,6 +95,26 @@ EOF
 elif ! grep -q '^# caloo' "$WG_CONF"; then
   die "$WG_CONF existe déjà et n'a pas été créé par Caloo.
   Relance avec un autre nom : CALOO_WG_IF=wg1 CALOO_WG_NET=10.9.0 sudo ./install.sh"
+fi
+
+# Ports : Caloo écoute sur des ports discrets ; les ports 53 et 80 du tunnel y sont redirigés.
+# Ainsi aucun conflit avec un nginx, Apache, Docker ou DNS déjà présent sur le VPS.
+sed -i '/# caloo-redirect$/d' "$WG_CONF"
+if iptables -t nat -S >/dev/null 2>&1; then
+  MODE=redirect
+  DNS_PORT=10053
+  HTTP_PORT=10080
+  rule() { echo "iptables -t nat -$1 PREROUTING -i %i -d $WG_IP -p $2 --dport $3 -j REDIRECT --to-ports $4"; }
+  up="$(rule A udp 53 $DNS_PORT); $(rule A tcp 53 $DNS_PORT); $(rule A tcp 80 $HTTP_PORT)"
+  down="$(rule D udp 53 $DNS_PORT); $(rule D tcp 53 $DNS_PORT); $(rule D tcp 80 $HTTP_PORT)"
+  sed -i "/^PrivateKey/a PostUp = $up # caloo-redirect" "$WG_CONF"
+  sed -i "/^PrivateKey/a PreDown = $down # caloo-redirect" "$WG_CONF"
+  echo "Redirection 53→$DNS_PORT et 80→$HTTP_PORT dans le tunnel."
+else
+  MODE=direct
+  DNS_PORT=53
+  HTTP_PORT=80
+  warn "iptables indisponible : Caloo écoutera directement sur les ports 53 et 80."
 fi
 
 # Laisse tes appareils se parler entre eux à travers le tunnel (peut échouer en LXC, sans gravité).
@@ -112,14 +142,30 @@ if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
 fi
 
 systemctl enable -q "wg-quick@$WG_IF"
-systemctl restart "wg-quick@$WG_IF" || die "WireGuard n'a pas démarré : journalctl -u wg-quick@$WG_IF"
+systemctl restart "wg-quick@$WG_IF" || die "WireGuard n'a pas démarré : journalctl -u wg-quick@$WG_IF -n 30"
 
 # ---------------------------------------------------------------- serveur Caloo
-say "Compilation du serveur Caloo (quelques minutes la première fois)"
-(cd "$REPO_DIR/server" && chmod +x gradlew && ./gradlew --no-daemon -q installDist)
+systemctl stop caloo 2>/dev/null || true
+
+if [[ ${CALOO_BUILD:-0} == 1 ]]; then
+  say "Compilation du serveur Caloo sur place"
+  apt-get install -y -qq openjdk-17-jdk-headless >/dev/null
+  (cd "$REPO_DIR/server" && chmod +x gradlew && ./gradlew --no-daemon -q installDist)
+  SRC="$REPO_DIR/server/build/install/caloo-server"
+else
+  say "Téléchargement du serveur Caloo (déjà compilé par GitHub)"
+  tmp=$(mktemp -d)
+  curl -fsSL --retry 3 "$RELEASE_URL" -o "$tmp/caloo-server.tar.gz" \
+    || die "téléchargement impossible : $RELEASE_URL
+  (ou compile sur place : CALOO_BUILD=1 sudo ./install.sh)"
+  tar -xzf "$tmp/caloo-server.tar.gz" -C "$tmp"
+  SRC="$tmp/caloo-server"
+  [[ -x $SRC/bin/caloo-server ]] || die "archive du serveur invalide"
+fi
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR"
-cp -r "$REPO_DIR/server/build/install/caloo-server/." "$APP_DIR/"
+cp -r "$SRC/." "$APP_DIR/"
+[[ ${CALOO_BUILD:-0} == 1 ]] || rm -rf "$tmp"
 install -m 755 "$REPO_DIR/scripts/caloo-peer" /usr/local/bin/caloo-peer
 
 id caloo &>/dev/null || useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin caloo
@@ -134,23 +180,41 @@ if [[ ! -f $CONF_DIR/config.json ]]; then
   TOKEN="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   cat > "$CONF_DIR/config.json" <<EOF
 {
-  "dnsBind": "$WG_NET.1",
-  "dnsPort": 53,
-  "httpBind": "$WG_NET.1",
-  "httpPort": 80,
-  "apiBind": "$WG_NET.1",
-  "apiPort": 8053,
-  "selfIp": "$WG_NET.1",
+  "dnsBind": "$WG_IP",
+  "dnsPort": $DNS_PORT,
+  "httpBind": "$WG_IP",
+  "httpPort": $HTTP_PORT,
+  "apiBind": "$WG_IP",
+  "apiPort": $API_PORT,
+  "selfIp": "$WG_IP",
   "upstream": ["1.1.1.1", "9.9.9.9"],
   "extensionsDir": "$DATA_DIR/extensions",
   "maxSiteMb": 100,
   "token": "$TOKEN"
 }
 EOF
+else
+  # Mise à jour : on garde le token et tes réglages, seuls les ports suivent le mode choisi.
+  sed -i -E "s/(\"dnsPort\": *)[0-9]+/\1$DNS_PORT/; s/(\"httpPort\": *)[0-9]+/\1$HTTP_PORT/" "$CONF_DIR/config.json"
 fi
 chown root:caloo "$CONF_DIR/config.json"
 chmod 640 "$CONF_DIR/config.json"
 
+# Vérifie que les ports de Caloo sont libres, et dit qui les occupe sinon.
+busy=""
+for p in "udp $DNS_PORT" "tcp $DNS_PORT" "tcp $HTTP_PORT" "tcp $API_PORT"; do
+  set -- $p
+  line="$(ss -Hln${1:0:1}p "sport = :$2" 2>/dev/null | grep -E "(\*|0\.0\.0\.0|\[::\]|$WG_IP):$2 " || true)"
+  [[ -n $line ]] && busy+="  port $2/$1 : $(grep -oE 'users:\(\("[^"]+"' <<<"$line" | head -1 | cut -d'"' -f2)"$'\n'
+done
+[[ -z $busy ]] || die "ces ports sont déjà utilisés par un autre programme :
+$busy  Libère-les puis relance le script."
+
+CAPS=""
+if [[ $MODE == direct ]]; then
+  CAPS="AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+fi
 # Les protections par « namespaces » de systemd échouent souvent dans un conteneur LXC.
 HARDENING=""
 if [[ $IN_CONTAINER == no ]]; then
@@ -169,23 +233,51 @@ Requires=wg-quick@$WG_IF.service
 [Service]
 User=caloo
 ExecStart=$APP_DIR/bin/caloo-server $CONF_DIR/config.json
-Environment=JAVA_OPTS=-Xmx160m
+Environment="JAVA_OPTS=-Xmx128m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xss512k"
 Restart=always
 RestartSec=3
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
+$CAPS
 $HARDENING
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+say "Démarrage de Caloo"
 systemctl daemon-reload
 systemctl enable -q caloo
 systemctl restart caloo
-sleep 4
-systemctl is-active -q caloo || die "Caloo n'a pas démarré : journalctl -u caloo -n 50"
+ok=no
+for _ in $(seq 1 20); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://$WG_IP:$API_PORT/api/status" || true)"
+  [[ $code == 401 ]] && { ok=yes; break; }
+  sleep 1
+done
+if [[ $ok != yes ]]; then
+  echo
+  systemctl status caloo --no-pager -n 0 || true
+  echo "----- derniers messages de Caloo -----"
+  journalctl -u caloo -n 30 --no-pager -o cat 2>/dev/null || true
+  die "Caloo n'a pas démarré. Envoie les lignes ci-dessus pour diagnostic."
+fi
+echo "Caloo répond sur http://$WG_IP:$API_PORT"
+
+# ---------------------------------------------------------------- nettoyage
+say "Nettoyage"
+pkill -f KotlinCompileDaemon 2>/dev/null || true
+rm -rf "$REPO_DIR/server/build" "$REPO_DIR/server/.gradle" "$REPO_DIR/server/.kotlin"
+if [[ ${CALOO_BUILD:-0} != 1 ]]; then
+  [[ -d /root/.gradle ]] && rm -rf /root/.gradle && echo "Cache de compilation /root/.gradle supprimé."
+  # Le JDK ne servait qu'à compiler : on le retire s'il n'entraîne rien d'autre avec lui.
+  if dpkg -s openjdk-17-jdk-headless &>/dev/null \
+     && [[ "$(apt-get -s remove openjdk-17-jdk-headless | grep -c '^Remv')" == 1 ]]; then
+    apt-mark manual openjdk-17-jre-headless >/dev/null
+    apt-get remove -y -qq openjdk-17-jdk-headless >/dev/null && echo "JDK de compilation retiré (Java runtime conservé)."
+  fi
+fi
+apt-get clean
+echo "Espace utilisé par Caloo : $(du -sh "$APP_DIR" | cut -f1) (programme) + $(du -sh "$DATA_DIR" | cut -f1) (extensions)."
 
 # ---------------------------------------------------------------- premier appareil
 if [[ -z "$(ls -A "$CONF_DIR/peers")" ]]; then
@@ -201,7 +293,7 @@ cat <<EOF
      (ou réaffiche-le avec : sudo caloo-peer show telephone). Active le tunnel.
   2. Ouvre http://caloo.home dans le navigateur du téléphone : la page d'accueil doit s'afficher.
   3. Installe l'app Caloo (APK des « Releases » GitHub) et renseigne :
-       Serveur : http://$WG_NET.1:8053
+       Serveur : http://$WG_IP:$API_PORT
        Token   : $TOKEN
 
   Autres appareils : sudo caloo-peer add pc-portable   (puis list / show / remove)

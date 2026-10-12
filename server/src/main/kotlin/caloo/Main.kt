@@ -1,6 +1,8 @@
 package caloo
 
 import java.io.File
+import java.net.BindException
+import kotlin.system.exitProcess
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -12,9 +14,9 @@ fun main(args: Array<String>) {
     store.reload().forEach { System.err.println("Extension ignoree : $it") }
 
     val log = QueryLog()
-    val dns = DnsServer(cfg, store, log).also { it.start() }
-    val web = WebServer(cfg, store).also { it.start() }
-    val api = ApiServer(cfg, store, log).also { it.start() }
+    val dns = open("le DNS", cfg.dnsBind, cfg.dnsPort) { DnsServer(cfg, store, log) }.also { it.start() }
+    val web = open("le serveur web", cfg.httpBind, cfg.httpPort) { WebServer(cfg, store) }.also { it.start() }
+    val api = open("l'API", cfg.apiBind, cfg.apiPort) { ApiServer(cfg, store, log) }.also { it.start() }
 
     // Les modifications faites à la main sur le serveur sont prises en compte toutes seules.
     Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay(
@@ -31,4 +33,13 @@ fun main(args: Array<String>) {
         dns.stop()
     })
     Thread.currentThread().join()
+}
+
+/** Ouvre un serveur, avec un message clair si le port est déjà pris ou l'adresse absente. */
+private fun <T> open(what: String, host: String, port: Int, create: () -> T): T = try {
+    create()
+} catch (e: BindException) {
+    System.err.println("ERREUR : impossible d'ouvrir $what sur $host:$port (${e.message}).")
+    System.err.println("Un autre programme utilise ce port, ou l'interface WireGuard n'est pas active.")
+    exitProcess(1)
 }

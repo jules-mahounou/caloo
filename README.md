@@ -25,7 +25,9 @@ sudo ./install.sh
 
 Le script s'occupe de tout :
 - WireGuard : version noyau, ou bascule automatique sur `wireguard-go` en conteneur LXC ;
-- compilation et service systemd `caloo` ;
+- téléchargement du serveur déjà compilé par GitHub (`CALOO_BUILD=1` pour compiler sur place) et service systemd `caloo` ;
+- Caloo écoute sur les ports 10053 et 10080. Les ports 53 et 80 **du tunnel uniquement** y sont redirigés, donc aucun conflit avec un nginx, Apache, Docker ou DNS déjà présent ;
+- nettoyage des fichiers de compilation inutiles ;
 - extensions d'exemple ;
 - création de l'appareil « telephone », avec un **QR code** à scanner.
 
