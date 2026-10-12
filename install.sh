@@ -97,6 +97,16 @@ elif ! grep -q '^# caloo' "$WG_CONF"; then
   Relance avec un autre nom : CALOO_WG_IF=wg1 CALOO_WG_NET=10.9.0 sudo ./install.sh"
 fi
 
+# Changement de port WireGuard (ex. sudo CALOO_WG_PORT=443 ./install.sh).
+OLD_PORT="$(grep -oP '^ListenPort *= *\K[0-9]+' "$WG_CONF" || true)"
+if [[ -n $OLD_PORT && $OLD_PORT != "$WG_PORT" ]]; then
+  if ss -Hlnu "sport = :$WG_PORT" 2>/dev/null | grep -q .; then
+    die "le port UDP $WG_PORT est déjà utilisé sur ce VPS : choisis-en un autre avec CALOO_WG_PORT=..."
+  fi
+  sed -i -E "s/^ListenPort *=.*/ListenPort = $WG_PORT/" "$WG_CONF"
+  echo "Port WireGuard : $OLD_PORT → $WG_PORT."
+fi
+
 # Ports : Caloo écoute sur des ports discrets ; les ports 53 et 80 du tunnel y sont redirigés.
 # Ainsi aucun conflit avec un nginx, Apache, Docker ou DNS déjà présent sur le VPS.
 redirect_ok() {
@@ -145,6 +155,16 @@ WG_NET=$WG_NET
 WG_PORT=$WG_PORT
 ENDPOINT=$ENDPOINT
 EOF
+
+# Les appareils existants suivent l'adresse et le port du serveur (à rescanner s'ils changent).
+CHANGED_PEERS=""
+for f in "$CONF_DIR"/peers/*.conf; do
+  [[ -f $f ]] || continue
+  if ! grep -q "^Endpoint = $ENDPOINT:$WG_PORT\$" "$f"; then
+    sed -i -E "s/^Endpoint *=.*/Endpoint = $ENDPOINT:$WG_PORT/" "$f"
+    CHANGED_PEERS+=" $(basename "$f" .conf)"
+  fi
+done
 
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow "$WG_PORT/udp" >/dev/null
@@ -303,6 +323,12 @@ echo "Espace utilisé par Caloo : $(du -sh "$APP_DIR" | cut -f1) (programme) + $
 if [[ -z "$(ls -A "$CONF_DIR/peers")" ]]; then
   say "Création de ton premier appareil : « telephone »"
   caloo-peer add telephone
+fi
+
+if [[ -n $CHANGED_PEERS ]]; then
+  say "Port ou adresse du serveur modifié : rescanne ces appareils"
+  for p in $CHANGED_PEERS; do caloo-peer show "$p"; done
+  warn "Dans l'app WireGuard, supprime l'ancien tunnel puis importe le nouveau QR code ci-dessus."
 fi
 
 TOKEN="$(grep -o '"token": *"[^"]*"' "$CONF_DIR/config.json" | cut -d'"' -f4)"
