@@ -1,0 +1,14 @@
+{
+  "enabled": false,
+  "priority": 0,
+  "domains": [
+    "doubleclick.net", "*.doubleclick.net",
+    "googlesyndication.com", "*.googlesyndication.com",
+    "googleadservices.com", "*.googleadservices.com",
+    "adservice.google.com"
+  ],
+  "action": "block",
+  "target": "",
+  "ttl": 300,
+  "options": {}
+}

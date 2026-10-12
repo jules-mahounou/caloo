@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "priority": 0,
+  "domains": ["caloo.home"],
+  "action": "site",
+  "target": "",
+  "ttl": 60,
+  "options": {}
+}

@@ -1,0 +1,72 @@
+name: Build Caloo
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-caloo
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Serveur (tests + compilation)
+        working-directory: server
+        run: ./gradlew --no-daemon test installDist
+
+      - name: Clé de signature Android (optionnelle)
+        env:
+          KEYSTORE_B64: ${{ secrets.CALOO_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/caloo.jks"
+            echo "CALOO_KEYSTORE=$RUNNER_TEMP/caloo.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Pas de secret CALOO_KEYSTORE_B64 : APK signé avec une clé de debug (voir README pour des mises à jour sans désinstaller)."
+          fi
+
+      - name: App Android
+        working-directory: android
+        env:
+          CALOO_KEYSTORE_PASSWORD: ${{ secrets.CALOO_KEYSTORE_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Préparer les fichiers
+        run: |
+          mkdir out
+          cp android/app/build/outputs/apk/release/app-release.apk out/caloo.apk
+          tar -C server/build/install -czf out/caloo-server.tar.gz caloo-server
+          ls -la out
+          echo "Taille de l'APK : $(du -h out/caloo.apk | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: caloo
+          path: out/
+
+      - name: Publier la release « caloo-latest »
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete caloo-latest --cleanup-tag -y || true
+          gh release create caloo-latest out/caloo.apk out/caloo-server.tar.gz \
+            --target "$GITHUB_SHA" \
+            --title "Caloo (build ${{ github.run_number }})" \
+            --notes "Branche ${GITHUB_REF_NAME}, commit ${GITHUB_SHA::7}. Installe caloo.apk sur ton téléphone." \
+            --prerelease

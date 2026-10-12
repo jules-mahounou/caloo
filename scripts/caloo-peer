@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Gère tes appareils (pairs WireGuard) pour Caloo.
+#   sudo caloo-peer add <nom>      crée un appareil et affiche son QR code
+#   sudo caloo-peer show <nom>     réaffiche sa config + QR code
+#   sudo caloo-peer list           liste les appareils
+#   sudo caloo-peer remove <nom>   supprime un appareil
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo "lance-moi avec sudo" >&2; exit 1; }
+source /etc/caloo/install.env
+CONF=/etc/wireguard/$WG_IF.conf
+PEERS=/etc/caloo/peers
+
+fail() { echo "Erreur : $*" >&2; exit 1; }
+check_name() { [[ ${1:-} =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || fail "nom invalide (lettres, chiffres, - et _)"; }
+
+apply() {
+  if ip link show "$WG_IF" &>/dev/null; then
+    wg syncconf "$WG_IF" <(wg-quick strip "$WG_IF")
+  fi
+}
+
+show() {
+  local f=$PEERS/$1.conf
+  [[ -f $f ]] || fail "appareil inconnu : $1"
+  echo "----- $1 ($f) -----"
+  cat "$f"
+  echo
+  qrencode -t ansiutf8 < "$f"
+}
+
+case "${1:-}" in
+  add)
+    name="${2:-}"; check_name "$name"
+    [[ ! -f $PEERS/$name.conf ]] || fail "« $name » existe déjà (sudo caloo-peer show $name)"
+    used="$(grep -oE "AllowedIPs *= *${WG_NET//./\\.}\.[0-9]+" "$CONF" | grep -oE '[0-9]+$' || true)"
+    ip=""
+    for i in $(seq 2 254); do
+      grep -qx "$i" <<<"$used" || { ip=$i; break; }
+    done
+    [[ -n $ip ]] || fail "plus d'adresse libre"
+    priv="$(wg genkey)"; pub="$(wg pubkey <<<"$priv")"; psk="$(wg genpsk)"
+    cat >> "$CONF" <<EOF
+### peer $name
+[Peer]
+PublicKey = $pub
+PresharedKey = $psk
+AllowedIPs = $WG_NET.$ip/32
+### end $name
+EOF
+    (umask 077
+     cat > "$PEERS/$name.conf" <<EOF
+[Interface]
+PrivateKey = $priv
+Address = $WG_NET.$ip/32
+DNS = $WG_NET.1
+
+[Peer]
+PublicKey = $(cat /etc/wireguard/caloo-server.pub)
+PresharedKey = $psk
+Endpoint = $ENDPOINT:$WG_PORT
+AllowedIPs = $WG_NET.0/24
+PersistentKeepalive = 25
+EOF
+    )
+    apply
+    show "$name"
+    ;;
+  show)
+    check_name "${2:-}"; show "$2"
+    ;;
+  list)
+    shopt -s nullglob
+    for f in "$PEERS"/*.conf; do
+      printf '%-20s %s\n' "$(basename "$f" .conf)" "$(grep -oE 'Address = [0-9./]+' "$f" | cut -d' ' -f3)"
+    done
+    ;;
+  remove)
+    name="${2:-}"; check_name "$name"
+    [[ -f $PEERS/$name.conf ]] || fail "appareil inconnu : $name"
+    sed -i "/^### peer $name\$/,/^### end $name\$/d" "$CONF"
+    rm -f "$PEERS/$name.conf"
+    apply
+    echo "« $name » supprimé."
+    ;;
+  *)
+    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac
